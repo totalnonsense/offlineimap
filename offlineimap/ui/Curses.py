@@ -16,21 +16,24 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
+from threading import RLock, Lock, Event
+import time
+import sys
+import os
+import signal
+import curses
 from Blinkenlights import BlinkenBase
 from UIBase import UIBase
-from threading import *
-import thread, time, sys, os, signal, time
-from offlineimap import version, threadutil
-from offlineimap.threadutil import MultiLock
+import offlineimap
 
-import curses, curses.panel, curses.textpad, curses.wrapper
 
 acctkeys = '1234567890abcdefghijklmnoprstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-=;/.,'
 
 class CursesUtil:
     def __init__(self):
         self.pairlock = Lock()
-        self.iolock = MultiLock()
+        # iolock protects access to the 
+        self.iolock = RLock()
         self.start()
 
     def initpairs(self):
@@ -43,9 +46,20 @@ class CursesUtil:
             self.pairlock.release()
 
     def lock(self):
+        """Locks the Curses ui thread
+
+        Can be invoked multiple times from the owning thread. Invoking
+        from a non-owning thread blocks and waits until it has been
+        unlocked by the owning thread."""
         self.iolock.acquire()
 
     def unlock(self):
+        """Unlocks the Curses ui thread
+
+        Decrease the lock counter by one and unlock the ui thread if the
+        counter reaches 0.  Only call this method when the calling
+        thread owns the lock. A RuntimeError is raised if this method is
+        called when the lock is unlocked."""
         self.iolock.release()
         
     def locked(self, target, *args, **kwargs):
@@ -251,7 +265,7 @@ class InputHandler:
         s.startthread()
 
     def startthread(s):
-        s.thread = threadutil.ExitNotifyThread(target = s.bgreaderloop,
+        s.thread = offlineimap.threadutil.ExitNotifyThread(target = s.bgreaderloop,
                                                name = "InputHandler loop")
         s.thread.setDaemon(1)
         s.thread.start()
@@ -321,7 +335,7 @@ class Blinkenlights(BlinkenBase, UIBase):
         s.setupwindows()
         s.inputhandler = InputHandler(s.c)
         s.gettf().setcolor('red')
-        s._msg(version.banner)
+        s._msg(offlineimap.banner)
         s.inputhandler.set_bgchar(s.keypress)
         signal.signal(signal.SIGWINCH, s.resizehandler)
         s.resizelock = Lock()
@@ -454,10 +468,10 @@ class Blinkenlights(BlinkenBase, UIBase):
         else:
             color = curses.A_REVERSE
         s.bannerwindow.bkgd(' ', color) # Fill background with that color
-        s.bannerwindow.addstr("%s %s" % (version.productname,
-                                         version.versionstr))
-        s.bannerwindow.addstr(0, s.bannerwindow.getmaxyx()[1] - len(version.copyright) - 1,
-                              version.copyright)
+        s.bannerwindow.addstr("%s %s" % (offlineimap.__productname__,
+                                         offlineimap.__version__))
+        s.bannerwindow.addstr(0, s.bannerwindow.getmaxyx()[1] - len(offlineimap.__copyright__) - 1,
+                              offlineimap.__copyright__)
         
         s.bannerwindow.noutrefresh()
 
@@ -543,10 +557,10 @@ class Blinkenlights(BlinkenBase, UIBase):
         s.c.stop()
         UIBase.mainException(s)
 
-    def sleep(s, sleepsecs, siglistener):
+    def sleep(s, sleepsecs, account):
         s.gettf().setcolor('red')
         s._msg("Next sync in %d:%02d" % (sleepsecs / 60, sleepsecs % 60))
-        return BlinkenBase.sleep(s, sleepsecs, siglistener)
+        return BlinkenBase.sleep(s, sleepsecs, account)
             
 if __name__ == '__main__':
     x = Blinkenlights(None)

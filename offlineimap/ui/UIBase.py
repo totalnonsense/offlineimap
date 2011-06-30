@@ -16,20 +16,26 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-import offlineimap.version
-import re, time, sys, traceback, threading, thread
+import re
+import time
+import sys
+import traceback
+import threading
 from StringIO import StringIO
-from Queue import Empty
+import offlineimap
 
-debugtypes = {'imap': 'IMAP protocol debugging',
+debugtypes = {'':'Other offlineimap related sync messages',
+              'imap': 'IMAP protocol debugging',
               'maildir': 'Maildir repository debugging',
               'thread': 'Threading debugging'}
 
 globalui = None
 def setglobalui(newui):
+    """Set the global ui object to be used for logging"""
     global globalui
     globalui = newui
 def getglobalui():
+    """Return the current ui object"""
     global globalui
     return globalui
 
@@ -61,8 +67,8 @@ class UIBase:
     def setlogfd(s, logfd):
         s.logfile = logfd
         logfd.write("This is %s %s\n" % \
-                    (offlineimap.version.productname,
-                     offlineimap.version.versionstr))
+                    (offlineimap.__productname__,
+                     offlineimap.__version__))
         logfd.write("Python: %s\n" % sys.version)
         logfd.write("Platform: %s\n" % sys.platform)
         logfd.write("Args: %s\n" % sys.argv)
@@ -85,11 +91,14 @@ class UIBase:
                   (threading.currentThread().getName(),
                    s.getthreadaccount(s), account)
         s.threadaccounts[threading.currentThread()] = account
+        s.debug('thread', "Register new thread '%s' (account '%s')" %\
+                    (threading.currentThread().getName(), account))
 
     def unregisterthread(s, thr):
         """Recognizes a thread has exited."""
         if s.threadaccounts.has_key(thr):
             del s.threadaccounts[thr]
+        s.debug('thread', "Unregister thread '%s'" % thr.getName())
 
     def getthreadaccount(s, thr = None):
         if not thr:
@@ -132,7 +141,10 @@ class UIBase:
         raise Exception, "Another OfflineIMAP is running with the same metadatadir; exiting."
 
     def getnicename(s, object):
-        prelimname = str(object.__class__).split('.')[-1]
+        """Return the type of a repository or Folder as string
+
+        (IMAP, Gmail, Maildir, etc...)"""
+        prelimname = object.__class__.__name__.split('.')[-1]
         # Strip off extra stuff.
         return re.sub('(Folder|Repository)', '', prelimname)
 
@@ -174,7 +186,7 @@ class UIBase:
         where the UI should do its setup -- TK, for instance, would
         create the application window here."""
         if s.verbose >= 0:
-            s._msg(offlineimap.version.banner)
+            s._msg(offlineimap.banner)
 
     def connecting(s, hostname, port):
         if s.verbose < 0:
@@ -257,17 +269,15 @@ class UIBase:
                     ", ".join([str(u) for u in uidlist]),
                     ds))
 
-    def addingflags(s, uidlist, flags, destlist):
+    def addingflags(s, uidlist, flags, dest):
         if s.verbose >= 0:
-            ds = s.folderlist(destlist)
-            s._msg("Adding flags %s to %d messages  on %s" % \
-                   (", ".join(flags), len(uidlist), ds))
+            s._msg("Adding flag %s to %d messages on %s" % \
+                   (", ".join(flags), len(uidlist), dest))
 
-    def deletingflags(s, uidlist, flags, destlist):
+    def deletingflags(s, uidlist, flags, dest):
         if s.verbose >= 0:
-            ds = s.folderlist(destlist)
-            s._msg("Deleting flags %s to %d messages on %s" % \
-                   (", ".join(flags), len(uidlist), ds))
+            s._msg("Deleting flag %s from %d messages on %s" % \
+                   (", ".join(flags), len(uidlist), dest))
 
     ################################################## Threads
 
@@ -331,33 +341,36 @@ class UIBase:
 
     ################################################## Other
 
-    def sleep(s, sleepsecs, siglistener):
+    def sleep(s, sleepsecs, account):
         """This function does not actually output anything, but handles
         the overall sleep, dealing with updates as necessary.  It will,
         however, call sleeping() which DOES output something.
 
-        Returns 0 if timeout expired, 1 if there is a request to cancel
-        the timer, and 2 if there is a request to abort the program."""
-
-        abortsleep = 0
+        :returns: 0/False if timeout expired, 1/2/True if there is a
+                  request to cancel the timer.
+        """
+        abortsleep = False
         while sleepsecs > 0 and not abortsleep:
-            try:
-                abortsleep = siglistener.get_nowait()
-                # retrieved signal while sleeping: 1 means immediately resynch, 2 means immediately die
-            except Empty:
-                # no signal
-                abortsleep = s.sleeping(1, sleepsecs)
-            sleepsecs -= 1
-        s.sleeping(0, 0)               # Done sleeping.
+            if account.get_abort_event():
+               abortsleep = True
+            else:
+                abortsleep = s.sleeping(10, sleepsecs)
+                sleepsecs -= 10            
+        s.sleeping(0, 0)  # Done sleeping.
         return abortsleep
 
     def sleeping(s, sleepsecs, remainingsecs):
-        """Sleep for sleepsecs, remainingsecs to go.
-        If sleepsecs is 0, indicates we're done sleeping.
+        """Sleep for sleepsecs, display remainingsecs to go.
 
-        Return 0 for normal sleep, or 1 to indicate a request
-        to sync immediately."""
-        s._msg("Next refresh in %d seconds" % remainingsecs)
+        Does nothing if sleepsecs <= 0.
+        Display a message on the screen every 10 seconds.
+
+        This implementation in UIBase does not support this, but some
+        implementations return 0 for successful sleep and 1 for an
+        'abort', ie a request to sync immediately.
+        """
         if sleepsecs > 0:
+            if remainingsecs % 10 == 0:
+                s._msg("Next refresh in %d seconds" % remainingsecs)
             time.sleep(sleepsecs)
         return 0

@@ -16,17 +16,23 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-from Base import BaseRepository
-from offlineimap import folder, imaputil, imapserver
+from offlineimap.repository.Base import BaseRepository
+from offlineimap import folder, imaputil, imapserver, OfflineImapError
 from offlineimap.folder.UIDMaps import MappedIMAPFolder
 from offlineimap.threadutil import ExitNotifyThread
-import re, types, os, netrc, errno
-from threading import *
+from threading import Event
+import re
+import types
+import os
+import netrc
+import errno
 
 class IMAPRepository(BaseRepository):
     def __init__(self, reposname, account):
         """Initialize an IMAPRepository object."""
         BaseRepository.__init__(self, reposname, account)
+        # self.ui is being set by the BaseRepository
+        self._host = None
         self.imapserver = imapserver.ConfigedIMAPServer(self)
         self.folders = None
         self.nametrans = lambda foldername: foldername
@@ -74,26 +80,49 @@ class IMAPRepository(BaseRepository):
         self.imapserver.close()
 
     def getholdconnectionopen(self):
+        if self.getidlefolders():
+            return 1
         return self.getconfboolean("holdconnectionopen", 0)
 
     def getkeepalive(self):
-        return self.getconfint("keepalive", 0)
+        num = self.getconfint("keepalive", 0)
+        if num == 0 and self.getidlefolders():
+            return 29*60
+        else:
+            return num
 
     def getsep(self):
         return self.imapserver.delim
 
     def gethost(self):
-        host = None
-        localeval = self.localeval
+        """Return the configured hostname to connect to
 
+        :returns: hostname as string or throws Exception"""
+        if self._host:  # use cached value if possible
+            return self._host
+
+        # 1) check for remotehosteval setting
         if self.config.has_option(self.getsection(), 'remotehosteval'):
             host = self.getconf('remotehosteval')
+            try:
+                host = self.localeval.eval(host)
+            except Exception, e:
+                raise OfflineImapError("remotehosteval option for repository "\
+                                       "'%s' failed:\n%s" % (self, e),
+                                       OfflineImapError.ERROR.REPO)
+            if host:
+                self._host = host
+                return self._host
+        # 2) check for plain remotehost setting
+        host = self.getconf('remotehost', None)
         if host != None:
-            return localeval.eval(host)
+            self._host = host
+            return self._host
 
-        host = self.getconf('remotehost')
-        if host != None:
-            return host
+        # no success
+        raise OfflineImapError("No remote host for repository "\
+                                   "'%s' specified." % self,
+                               OfflineImapError.ERROR.REPO)
 
     def getuser(self):
         user = None
@@ -139,37 +168,67 @@ class IMAPRepository(BaseRepository):
     def getsslclientkey(self):
         return self.getconf('sslclientkey', None)
 
+    def getsslcacertfile(self):
+        """Return the absolute path of the CA certfile to use, if any"""
+        cacertfile = self.getconf('sslcacertfile', None)
+        if cacertfile is None:
+            return None
+        cacertfile = os.path.expanduser(cacertfile)
+        cacertfile = os.path.abspath(cacertfile)
+        if not os.path.isfile(cacertfile):
+            raise SyntaxWarning("CA certfile for repository '%s' could "
+                                "not be found. No such file: '%s'" \
+                                % (self.name, cacertfile))
+        return cacertfile
+
     def getpreauthtunnel(self):
         return self.getconf('preauthtunnel', None)
 
     def getreference(self):
         return self.getconf('reference', '""')
 
+    def getidlefolders(self):
+        localeval = self.localeval
+        return localeval.eval(self.getconf('idlefolders', '[]'))
+
     def getmaxconnections(self):
-        return self.getconfint('maxconnections', 1)
+        num1 = len(self.getidlefolders())
+        num2 = self.getconfint('maxconnections', 1)
+        return max(num1, num2)
 
     def getexpunge(self):
         return self.getconfboolean('expunge', 1)
 
     def getpassword(self):
-        passwd = None
-        localeval = self.localeval
+        """Return the IMAP password for this repository.
 
-        if self.config.has_option(self.getsection(), 'remotepasseval'):
-            passwd = self.getconf('remotepasseval')
+        It tries to get passwords in the following order:
+
+        1. evaluate Repository 'remotepasseval'
+        2. read password from Repository 'remotepass'
+        3. read password from file specified in Repository 'remotepassfile'
+        4. read password from ~/.netrc
+        5. read password from /etc/netrc
+
+        On success we return the password.
+        If all strategies fail we return None.
+        """
+        # 1. evaluate Repository 'remotepasseval'
+        passwd = self.getconf('remotepasseval', None)
         if passwd != None:
-            return localeval.eval(passwd)
-
+            return self.localeval.eval(passwd)
+        # 2. read password from Repository 'remotepass'
         password = self.getconf('remotepass', None)
         if password != None:
             return password
+        # 3. read password from file specified in Repository 'remotepassfile'
         passfile = self.getconf('remotepassfile', None)
         if passfile != None:
             fd = open(os.path.expanduser(passfile))
             password = fd.readline().strip()
             fd.close()
             return password
-
+        # 4. read password from ~/.netrc
         try:
             netrcentry = netrc.netrc().authenticators(self.gethost())
         except IOError, inst:
@@ -180,6 +239,7 @@ class IMAPRepository(BaseRepository):
                 user = self.getconf('remoteuser')
                 if user == None or user == netrcentry[0]:
                     return netrcentry[2]
+        # 5. read password from /etc/netrc
         try:
             netrcentry = netrc.netrc('/etc/netrc').authenticators(self.gethost())
         except IOError, inst:
@@ -190,7 +250,9 @@ class IMAPRepository(BaseRepository):
                 user = self.getconf('remoteuser')
                 if user == None or user == netrcentry[0]:
                     return netrcentry[2]
+        # no strategy yielded a password!
         return None
+
 
     def getfolder(self, foldername):
         return self.getfoldertype()(self.imapserver, foldername,
@@ -233,6 +295,8 @@ class IMAPRepository(BaseRepository):
                 continue
             foldername = imaputil.dequote(name)
             if not self.folderfilter(foldername):
+                self.ui.debug('imap',"Filtering out '%s' due to folderfilter" %\
+                                  foldername)
                 continue
             retval.append(self.getfoldertype()(self.imapserver, foldername,
                                                self.nametrans(foldername),

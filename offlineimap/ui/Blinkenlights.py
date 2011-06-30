@@ -16,10 +16,9 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-from threading import *
+from threading import RLock, currentThread
 from offlineimap.ui.UIBase import UIBase
-import thread
-from offlineimap.threadutil import MultiLock
+from thread import get_ident	# python < 2.6 support
 
 class BlinkenBase:
     """This is a mix-in class that should be mixed in with either UIBase
@@ -67,13 +66,13 @@ class BlinkenBase:
         s.gettf().setcolor('red')
         s.__class__.__bases__[-1].deletingmessage(s, uid, destlist)
 
-    def addingflags(s, uidlist, flags, destlist):
+    def addingflags(s, uidlist, flags, dest):
         s.gettf().setcolor('yellow')
-        s.__class__.__bases__[-1].addingflags(s, uidlist, flags, destlist)
+        s.__class__.__bases__[-1].addingflags(s, uidlist, flags, dest)
 
-    def deletingflags(s, uidlist, flags, destlist):
+    def deletingflags(s, uidlist, flags, dest):
         s.gettf().setcolor('pink')
-        s.__class__.__bases__[-1].deletingflags(s, uidlist, flags, destlist)
+        s.__class__.__bases__[-1].deletingflags(s, uidlist, flags, dest)
 
     def warn(s, msg, minor = 0):
         if minor:
@@ -85,7 +84,8 @@ class BlinkenBase:
     def init_banner(s):
         s.availablethreadframes = {}
         s.threadframes = {}
-        s.tflock = MultiLock()
+        #tflock protects the s.threadframes manipulation to only happen from 1 thread
+        s.tflock = RLock()
 
     def threadExited(s, thread):
         threadid = thread.threadid
@@ -103,7 +103,7 @@ class BlinkenBase:
         UIBase.threadExited(s, thread)
 
     def gettf(s):
-        threadid = thread.get_ident()
+        threadid = get_ident()
         accountname = s.getthreadaccount()
 
         s.tflock.acquire()
@@ -132,10 +132,10 @@ class BlinkenBase:
         s.gettf().setcolor('white')
         s.__class__.__bases__[-1].callhook(s, msg)
             
-    def sleep(s, sleepsecs, siglistener):
+    def sleep(s, sleepsecs, account):
         s.gettf().setcolor('red')
         s.getaccountframe().startsleep(sleepsecs)
-        return UIBase.sleep(s, sleepsecs, siglistener)
+        return UIBase.sleep(s, sleepsecs, account)
 
     def sleeping(s, sleepsecs, remainingsecs):
         if remainingsecs and s.gettf().getcolor() == 'black':

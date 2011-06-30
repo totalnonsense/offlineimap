@@ -16,22 +16,23 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-import re, string, types
-from offlineimap.ui import UIBase
+import re
+import string
+import types
+from offlineimap.ui import getglobalui
 quotere = re.compile('^("(?:[^"]|\\\\")*")')
 
 def debug(*args):
     msg = []
     for arg in args:
         msg.append(str(arg))
-    UIBase.getglobalui().debug('imap', " ".join(msg))
+    getglobalui().debug('imap', " ".join(msg))
 
 def dequote(string):
     """Takes a string which may or may not be quoted and returns it, unquoted.
     This function does NOT consider parenthised lists to be quoted.
     """
 
-    debug("dequote() called with input:", string)
     if not (string[0] == '"' and string[-1] == '"'):
         return string
     string = string[1:-1]               # Strip off quotes.
@@ -46,7 +47,6 @@ def flagsplit(string):
     return imapsplit(string[1:-1])
 
 def options2hash(list):
-    debug("options2hash called with input:", list)
     retval = {}
     counter = 0
     while (counter < len(list)):
@@ -68,7 +68,6 @@ def imapsplit(imapstring):
 
     ['(\\HasNoChildren)', '"."', '"INBOX.Sent"']"""
 
-    debug("imapsplit() called with input:", imapstring)
     if type(imapstring) != types.StringType:
         debug("imapsplit() got a non-string input; working around.")
         # Sometimes, imaplib will throw us a tuple if the input
@@ -147,30 +146,26 @@ def imapsplit(imapstring):
     debug("imapsplit() returning:", retval)
     return retval
             
+flagmap = [('\\Seen', 'S'),
+           ('\\Answered', 'R'),
+           ('\\Flagged', 'F'),
+           ('\\Deleted', 'T'),
+           ('\\Draft', 'D')]
+
 def flagsimap2maildir(flagstring):
-    flagmap = {'\\seen': 'S',
-               '\\answered': 'R',
-               '\\flagged': 'F',
-               '\\deleted': 'T',
-               '\\draft': 'D'}
     retval = []
     imapflaglist = [x.lower() for x in flagstring[1:-1].split()]
-    for imapflag in imapflaglist:
-        if flagmap.has_key(imapflag):
-            retval.append(flagmap[imapflag])
+    for imapflag, maildirflag in flagmap:
+        if imapflag.lower() in imapflaglist:
+            retval.append(maildirflag)
     retval.sort()
     return retval
 
-def flagsmaildir2imap(list):
-    flagmap = {'S': '\\Seen',
-               'R': '\\Answered',
-               'F': '\\Flagged',
-               'T': '\\Deleted',
-               'D': '\\Draft'}
+def flagsmaildir2imap(maildirflaglist):
     retval = []
-    for mdflag in list:
-        if flagmap.has_key(mdflag):
-            retval.append(flagmap[mdflag])
+    for imapflag, maildirflag in flagmap:
+        if maildirflag in maildirflaglist:
+            retval.append(imapflag)
     retval.sort()
     return '(' + ' '.join(retval) + ')'
 

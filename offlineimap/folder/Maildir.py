@@ -16,16 +16,19 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-import os.path, os, re, time, socket
+import socket
+import time
+import re
+import os
 from Base import BaseFolder
-from offlineimap import imaputil
-from offlineimap.ui import UIBase
 from threading import Lock
 
 try:
     from hashlib import md5
 except ImportError:
     from md5 import md5
+
+from offlineimap import OfflineImapError
 
 uidmatchre = re.compile(',U=(\d+)')
 flagmatchre = re.compile(':.*2,([A-Z]+)')
@@ -61,12 +64,16 @@ class MaildirFolder(BaseFolder):
         self.repository = repository
         self.accountname = accountname
         BaseFolder.__init__(self)
+        #self.ui is set in BaseFolder.init()
+        # Cache the full folder path, as we use getfullname() very often
+        self._fullname = os.path.join(self.getroot(), self.getname())
 
     def getaccountname(self):
         return self.accountname
 
     def getfullname(self):
-        return os.path.join(self.getroot(), self.getname())
+        """Return the absolute file path to the Maildir folder (sans cur|new)"""
+        return self._fullname
 
     def getuidvalidity(self):
         """Maildirs have no notion of uidvalidity, so we just return a magic
@@ -160,16 +167,17 @@ class MaildirFolder(BaseFolder):
         return retval
 
     def quickchanged(self, statusfolder):
+        """Returns True if the Maildir has changed"""
         self.cachemessagelist()
-        savedmessages = statusfolder.getmessagelist()
-        if len(self.messagelist) != len(savedmessages):
+        # Folder has different uids than statusfolder => TRUE
+        if sorted(self.getmessageuidlist()) != \
+                sorted(statusfolder.getmessageuidlist()):
             return True
-        for uid in self.messagelist.keys():
-            if uid not in savedmessages:
+        # Also check for flag changes, it's quick on a Maildir 
+        for (uid, message) in self.getmessagelist().iteritems():
+            if message['flags'] != statusfolder.getmessageflags(uid):
                 return True
-            if self.messagelist[uid]['flags'] != savedmessages[uid]['flags']:
-                return True
-        return False
+        return False  #Nope, nothing changed
 
     def cachemessagelist(self):
         if self.messagelist is None:
@@ -179,84 +187,75 @@ class MaildirFolder(BaseFolder):
         return self.messagelist
 
     def getmessage(self, uid):
+        """Return the content of the message"""
         filename = self.messagelist[uid]['filename']
-        file = open(filename, 'rt')
+        filepath = os.path.join(self.getfullname(), filename)
+        file = open(filepath, 'rt')
         retval = file.read()
         file.close()
+        #TODO: WHY are we replacing \r\n with \n here? And why do we
+        #      read it as text?
         return retval.replace("\r\n", "\n")
 
     def getmessagetime( self, uid ):
         filename = self.messagelist[uid]['filename']
-        st = os.stat(filename)
+        filepath = os.path.join(self.getfullname(), filename)
+        st = os.stat(filepath)
         return st.st_mtime
 
     def savemessage(self, uid, content, flags, rtime):
         # This function only ever saves to tmp/,
         # but it calls savemessageflags() to actually save to cur/ or new/.
-        ui = UIBase.getglobalui()
-        ui.debug('maildir', 'savemessage: called to write with flags %s and content %s' % \
-                 (repr(flags), repr(content)))
+        self.ui.debug('maildir', 'savemessage: called to write with flags %s '
+                      'and content %s' % (repr(flags), repr(content)))
         if uid < 0:
             # We cannot assign a new uid.
             return uid
         if uid in self.messagelist:
-            # We already have it.
+            # We already have it, just update flags.
             self.savemessageflags(uid, flags)
             return uid
 
         # Otherwise, save the message in tmp/ and then call savemessageflags()
         # to give it a permanent home.
         tmpdir = os.path.join(self.getfullname(), 'tmp')
-        messagename = None
-        attempts = 0
-        while 1:
-            if attempts > 15:
-                raise IOError, "Couldn't write to file %s" % messagename
-            timeval, timeseq = gettimeseq()
-            messagename = '%d_%d.%d.%s,U=%d,FMD5=%s' % \
-                          (timeval,
-                           timeseq,
-                           os.getpid(),
-                           socket.gethostname(),
-                           uid,
-                           md5(self.getvisiblename()).hexdigest())
-            if os.path.exists(os.path.join(tmpdir, messagename)):
-                time.sleep(2)
-                attempts += 1
+        timeval, timeseq = gettimeseq()
+        messagename = '%d_%d.%d.%s,U=%d,FMD5=%s' % \
+            (timeval,
+             timeseq,
+             os.getpid(),
+             socket.gethostname(),
+             uid,
+             md5(self.getvisiblename()).hexdigest())
+        # open file and write it out
+        try:
+            fd = os.open(os.path.join(tmpdir, messagename),
+                           os.O_EXCL|os.O_CREAT|os.O_WRONLY)
+        except OSError, e:
+            if e.errno == 17: 
+                #FILE EXISTS ALREADY
+                severity = OfflineImapError.ERROR.MESSAGE
+                raise OfflineImapError("Unique filename %s already existing." %\
+                                           messagename, severity)
             else:
-                break
-        tmpmessagename = messagename.split(',')[0]
-        ui.debug('maildir', 'savemessage: using temporary name %s' % tmpmessagename)
-        file = open(os.path.join(tmpdir, tmpmessagename), "wt")
-        file.write(content)
+                raise
 
+        file = os.fdopen(fd, 'wt')
+        file.write(content)
         # Make sure the data hits the disk
         file.flush()
         if self.dofsync:
-            os.fsync(file.fileno())
-
+            os.fsync(fd)
         file.close()
-        if rtime != None:
-            os.utime(os.path.join(tmpdir,tmpmessagename), (rtime,rtime))
-        ui.debug('maildir', 'savemessage: moving from %s to %s' % \
-                 (tmpmessagename, messagename))
-        if tmpmessagename != messagename: # then rename it
-            os.rename(os.path.join(tmpdir, tmpmessagename),
-                    os.path.join(tmpdir, messagename))
 
-        if self.dofsync:
-            try:
-                # fsync the directory (safer semantics in Linux)
-                fd = os.open(tmpdir, os.O_RDONLY)
-                os.fsync(fd)
-                os.close(fd)
-            except:
-                pass
+        if rtime != None:
+            os.utime(os.path.join(tmpdir, messagename), (rtime, rtime))
 
         self.messagelist[uid] = {'uid': uid, 'flags': [],
-                                 'filename': os.path.join(tmpdir, messagename)}
+                                 'filename': os.path.join('tmp', messagename)}
+        # savemessageflags moves msg to 'cur' or 'new' as appropriate
         self.savemessageflags(uid, flags)
-        ui.debug('maildir', 'savemessage: returning uid %d' % uid)
+        self.ui.debug('maildir', 'savemessage: returning uid %d' % uid)
         return uid
         
     def getmessageflags(self, uid):
@@ -264,14 +263,14 @@ class MaildirFolder(BaseFolder):
 
     def savemessageflags(self, uid, flags):
         oldfilename = self.messagelist[uid]['filename']
-        newpath, newname = os.path.split(oldfilename)
+        dir_prefix, newname = os.path.split(oldfilename)
         tmpdir = os.path.join(self.getfullname(), 'tmp')
         if 'S' in flags:
             # If a message has been seen, it goes into the cur
-            # directory.  CR debian#152482, [complete.org #4]
-            newpath = os.path.join(self.getfullname(), 'cur')
+            # directory.  CR debian#152482
+            dir_prefix = 'cur'
         else:
-            newpath = os.path.join(self.getfullname(), 'new')
+            dir_prefix = 'new'
         infostr = ':'
         infomatch = re.search('(:.*)$', newname)
         if infomatch:                   # If the info string is present..
@@ -282,27 +281,39 @@ class MaildirFolder(BaseFolder):
         infostr += '2,' + ''.join(flags)
         newname += infostr
         
-        newfilename = os.path.join(newpath, newname)
+        newfilename = os.path.join(dir_prefix, newname)
         if (newfilename != oldfilename):
-            os.rename(oldfilename, newfilename)
+            os.rename(os.path.join(self.getfullname(), oldfilename),
+                      os.path.join(self.getfullname(), newfilename))
             self.messagelist[uid]['flags'] = flags
             self.messagelist[uid]['filename'] = newfilename
 
         # By now, the message had better not be in tmp/ land!
         final_dir, final_name = os.path.split(self.messagelist[uid]['filename'])
-        assert final_dir != tmpdir
+        assert final_dir != 'tmp'
 
     def deletemessage(self, uid):
-        if not uid in self.messagelist:
+        """Unlinks a message file from the Maildir.
+
+        :param uid: UID of a mail message
+        :type uid: String
+        :return: Nothing, or an Exception if UID but no corresponding file
+                 found.
+        """
+        if not self.uidexists(uid):
             return
+
         filename = self.messagelist[uid]['filename']
+        filepath = os.path.join(self.getfullname(), filename)
         try:
-            os.unlink(filename)
+            os.unlink(filepath)
         except OSError:
             # Can't find the file -- maybe already deleted?
             newmsglist = self._scanfolder()
             if uid in newmsglist:       # Nope, try new filename.
-                os.unlink(newmsglist[uid]['filename'])
+                filename = newmsglist[uid]['filename']
+                filepath = os.path.join(self.getfullname(), filename)
+                os.unlink(filepath)
             # Yep -- return.
         del(self.messagelist[uid])
         

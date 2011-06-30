@@ -16,11 +16,12 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-from threading import *
-from StringIO import StringIO
+from threading import Lock, Thread, BoundedSemaphore
 from Queue import Queue, Empty
-import sys, traceback, thread, time
-from offlineimap.ui import UIBase       # for getglobalui()
+import traceback
+from thread import get_ident	# python < 2.6 support
+import sys
+from offlineimap.ui import getglobalui
 
 profiledir = None
 
@@ -41,14 +42,6 @@ def semaphorereset(semaphore, originalstate):
     for i in range(originalstate):
         semaphore.release()
         
-def semaphorewait(semaphore):
-    semaphore.acquire()
-    semaphore.release()
-    
-def threadsreset(threadlist):
-    for thr in threadlist:
-        thr.join()
-
 class threadlist:
     def __init__(self):
         self.lock = Lock()
@@ -90,37 +83,37 @@ class threadlist:
 ######################################################################
 
 exitthreads = Queue(100)
-inited = 0
-
-def initexitnotify():
-    """Initialize the exit notify system.  This MUST be called from the
-    SAME THREAD that will call monitorloop BEFORE it calls monitorloop.
-    This SHOULD be called before the main thread starts any other
-    ExitNotifyThreads, or else it may miss the ability to catch the exit
-    status from them!"""
-    pass
 
 def exitnotifymonitorloop(callback):
-    """Enter an infinite "monitoring" loop.  The argument, callback,
-    defines the function to call when an ExitNotifyThread has terminated.
-    That function is called with a single argument -- the ExitNotifyThread
-    that has terminated.  The monitor will not continue to monitor for
-    other threads until the function returns, so if it intends to perform
-    long calculations, it should start a new thread itself -- but NOT
-    an ExitNotifyThread, or else an infinite loop may result.  Furthermore,
-    the monitor will hold the lock all the while the other thread is waiting.
+    """An infinite "monitoring" loop watching for finished ExitNotifyThread's.
+
+    :param callback: the function to call when a thread terminated. That 
+                     function is called with a single argument -- the 
+                     ExitNotifyThread that has terminated. The monitor will 
+                     not continue to monitor for other threads until
+                     'callback' returns, so if it intends to perform long
+                     calculations, it should start a new thread itself -- but
+                     NOT an ExitNotifyThread, or else an infinite loop 
+                     may result.
+                     Furthermore, the monitor will hold the lock all the 
+                     while the other thread is waiting.
+    :type callback:  a callable function
     """
     global exitthreads
-    while 1:                            # Loop forever.
+    while 1:                            
+        # Loop forever and call 'callback' for each thread that exited
         try:
-            thrd = exitthreads.get(False)
+            # we need a timeout in the get() call, so that ctrl-c can throw
+            # a SIGINT (http://bugs.python.org/issue1360). A timeout with empty
+            # Queue will raise `Empty`.
+            thrd = exitthreads.get(True, 60)
             callback(thrd)
         except Empty:
-            time.sleep(1)
+            pass
 
 def threadexited(thread):
     """Called when a thread exits."""
-    ui = UIBase.getglobalui()
+    ui = getglobalui()
     if thread.getExitCause() == 'EXCEPTION':
         if isinstance(thread.getExitException(), SystemExit):
             # Bring a SystemExit into the main thread.
@@ -129,12 +122,10 @@ def threadexited(thread):
             raise SystemExit
         ui.threadException(thread)      # Expected to terminate
         sys.exit(100)                   # Just in case...
-        os._exit(100)
     elif thread.getExitMessage() == 'SYNC_WITH_TIMER_TERMINATE':
         ui.terminate()
         # Just in case...
         sys.exit(100)
-        os._exit(100)
     else:
         ui.threadExited(thread)
 
@@ -143,12 +134,15 @@ class ExitNotifyThread(Thread):
     exited and to provide for the ability for it to find out why."""
     def run(self):
         global exitthreads, profiledir
-        self.threadid = thread.get_ident()
+        self.threadid = get_ident()
         try:
             if not profiledir:          # normal case
                 Thread.run(self)
             else:
-                import profile
+                try:
+                    import cProfile as profile
+                except ImportError:
+                    import profile
                 prof = profile.Profile()
                 try:
                     prof = prof.runctx("Thread.run(self)", globals(), locals())
@@ -161,9 +155,8 @@ class ExitNotifyThread(Thread):
             self.setExitCause('EXCEPTION')
             if sys:
                 self.setExitException(sys.exc_info()[1])
-                sbuf = StringIO()
-                traceback.print_exc(file = sbuf)
-                self.setExitStackTrace(sbuf.getvalue())
+                tb = traceback.format_exc()
+                self.setExitStackTrace(tb)
         else:
             self.setExitCause('NORMAL')
         if not hasattr(self, 'exitmessage'):
@@ -234,56 +227,3 @@ class InstanceLimitedThread(ExitNotifyThread):
         finally:
             if instancelimitedsems and instancelimitedsems[self.instancename]:
                 instancelimitedsems[self.instancename].release()
-        
-    
-######################################################################
-# Multi-lock -- capable of handling a single thread requesting a lock
-# multiple times
-######################################################################
-
-class MultiLock:
-    def __init__(self):
-        self.lock = Lock()
-        self.statuslock = Lock()
-        self.locksheld = {}
-
-    def acquire(self):
-        """Obtain a lock.  Provides nice support for a single
-        thread trying to lock it several times -- as may be the case
-        if one I/O-using object calls others, while wanting to make it all
-        an atomic operation.  Keeps a "lock request count" for the current
-        thread, and acquires the lock when it goes above zero, releases when
-        it goes below one.
-
-        This call is always blocking."""
-        
-        # First, check to see if this thread already has a lock.
-        # If so, increment the lock count and just return.
-        self.statuslock.acquire()
-        try:
-            threadid = thread.get_ident()
-
-            if threadid in self.locksheld:
-                self.locksheld[threadid] += 1
-                return
-            else:
-                # This is safe because it is a per-thread structure
-                self.locksheld[threadid] = 1
-        finally:
-            self.statuslock.release()
-        self.lock.acquire()
-
-    def release(self):
-        self.statuslock.acquire()
-        try:
-            threadid = thread.get_ident()
-            if self.locksheld[threadid] > 1:
-                self.locksheld[threadid] -= 1
-                return
-            else:
-                del self.locksheld[threadid]
-                self.lock.release()
-        finally:
-            self.statuslock.release()
-
-        

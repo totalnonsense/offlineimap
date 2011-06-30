@@ -15,36 +15,39 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-VERSION=4.0.16
+VERSION=`./offlineimap.py --version`
 TARGZ=offlineimap_$(VERSION).tar.gz
 SHELL=/bin/bash
+RST2HTML=`type rst2html >/dev/null 2>&1 && echo rst2html || echo rst2html.py`
+
+all: build
+
+build:
+	python setup.py build
+	@echo
+	@echo "Build process finished, run 'python setup.py install' to install" \
+		"or 'python setup.py --help' for more information".
 
 clean:
 	-python setup.py clean --all
-	-rm -f `find . -name "*~"`
-	-rm -f `find . -name "*.tmp"`
 	-rm -f bin/offlineimapc
-	-rm -f `find . -name "*.pyc"`
-	-rm -f `find . -name "*.pygc"`
-	-rm -f `find . -name "*.class"`
-	-rm -f `find . -name "*.bak"`
-	-rm -f `find . -name ".cache*"`
+	-find . -name '*.pyc' -exec rm -f {} \;
+	-find . -name '*.pygc' -exec rm -f {} \;
+	-find . -name '*.class' -exec rm -f {} \;
+	-find . -name '.cache*' -exec rm -f {} \;
+	-find . -name '*.html' -exec rm -f {} \;
 	-rm -f manpage.links manpage.refs
 	-find . -name auth -exec rm -vf {}/password {}/username \;
-	-rm -f manual.html manual.pdf manual.txt manual.ps offlineimap.1
+	@$(MAKE) -C docs clean
 
-doc: 
-	docbook2man offlineimap.sgml
-	docbook2man offlineimap.sgml
-	docbook2html -u offlineimap.sgml
-	mv offlineimap.html manual.html
-	man -t -l offlineimap.1 > manual.ps
-	ps2pdf manual.ps
-	groff -Tascii -man offlineimap.1 | sed $$'s/.\b//g' > manual.txt
-	-rm manpage.links manpage.refs manual.ps
+man:
+	@$(MAKE) -C docs man
 
-faq:
-	curl -o FAQ.html http://software.complete.org/offlineimap/wiki/FrequentlyAskedQuestions
+doc:
+	@$(MAKE) -C docs
+	$(RST2HTML) README.rst readme.html
+	$(RST2HTML) SubmittingPatches.rst SubmittingPatches.html
+	$(RST2HTML) Changelog.rst Changelog.html
 
 targz: ../$(TARGZ)
 ../$(TARGZ):

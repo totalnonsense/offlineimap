@@ -15,77 +15,14 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-from offlineimap import threadutil, mbnames, CustomConfig
-import offlineimap.repository.Base, offlineimap.repository.LocalStatus
-from offlineimap.ui import UIBase
-from offlineimap.threadutil import InstanceLimitedThread, ExitNotifyThread
+from offlineimap import mbnames, CustomConfig, OfflineImapError
+from offlineimap.repository import Repository
+from offlineimap.ui import getglobalui
+from offlineimap.threadutil import InstanceLimitedThread
 from subprocess import Popen, PIPE
-from threading import Event, Lock
+from threading import Event
 import os
-from Queue import Queue, Empty
-import sys
-
-class SigListener(Queue):
-    def __init__(self):
-        self.folderlock = Lock()
-        self.folders = None
-        Queue.__init__(self, 20)
-    def put_nowait(self, sig):
-        self.folderlock.acquire()
-        try:
-            if sig == 1:
-                if self.folders is None or not self.autorefreshes:
-                    # folders haven't yet been added, or this account is once-only; drop signal
-                    return
-                elif self.folders:
-                    for foldernr in range(len(self.folders)):
-                        # requeue folder
-                        self.folders[foldernr][1] = True
-                    self.quick = False
-                    return
-                # else folders have already been cleared, put signal...
-        finally:
-            self.folderlock.release()
-        Queue.put_nowait(self, sig)
-    def addfolders(self, remotefolders, autorefreshes, quick):
-        self.folderlock.acquire()
-        try:
-            self.folders = []
-            self.quick = quick
-            self.autorefreshes = autorefreshes
-            for folder in remotefolders:
-                # new folders are queued
-                self.folders.append([folder, True])
-        finally:
-            self.folderlock.release()
-    def clearfolders(self):
-        self.folderlock.acquire()
-        try:
-            for folder, queued in self.folders:
-                if queued:
-                    # some folders still in queue
-                    return False
-            self.folders[:] = []
-            return True
-        finally:
-            self.folderlock.release()
-    def queuedfolders(self):
-        self.folderlock.acquire()
-        try:
-            dirty = True
-            while dirty:
-                dirty = False
-                for foldernr, (folder, queued) in enumerate(self.folders):
-                    if queued:
-                        # mark folder as no longer queued
-                        self.folders[foldernr][1] = False
-                        dirty = True
-                        quick = self.quick
-                        self.folderlock.release()
-                        yield (folder, quick)
-                        self.folderlock.acquire()
-        finally:
-            self.folderlock.release()
+import traceback
 
 def getaccountlist(customconfig):
     return customconfig.getsectionlist('Account')
@@ -100,15 +37,29 @@ def AccountHashGenerator(customconfig):
         retval[item.getname()] = item
     return retval
 
-mailboxes = []
 
 class Account(CustomConfig.ConfigHelperMixin):
+    """Represents an account (ie. 2 repositories) to sync
+
+    Most of the time you will actually want to use the derived
+    :class:`accounts.SyncableAccount` which contains all functions used
+    for syncing an account."""
+    #signal gets set when we should stop looping
+    abort_signal = Event()
+
     def __init__(self, config, name):
+        """
+        :param config: Representing the offlineimap configuration file.
+        :type config: :class:`offlineimap.CustomConfig.CustomConfigParser`
+
+        :param name: A string denoting the name of the Account
+                     as configured"""
         self.config = config
         self.name = name
         self.metadatadir = config.getmetadatadir()
         self.localeval = config.getlocaleval()
-        self.ui = UIBase.getglobalui()
+        #Contains the current :mod:`offlineimap.ui`, and can be used for logging etc.
+        self.ui = getglobalui()
         self.refreshperiod = self.getconffloat('autorefresh', 0.0)
         self.quicknum = 0
         if self.refreshperiod == 0.0:
@@ -123,16 +74,55 @@ class Account(CustomConfig.ConfigHelperMixin):
     def getname(self):
         return self.name
 
+    def __str__(self):
+        return self.name
+
     def getsection(self):
         return 'Account ' + self.getname()
 
-    def sleeper(self, siglistener):
-        """Sleep handler.  Returns same value as UIBase.sleep:
-        0 if timeout expired, 1 if there was a request to cancel the timer,
-        and 2 if there is a request to abort the program.
+    @classmethod
+    def set_abort_event(cls, config, signum):
+        """Set skip sleep/abort event for all accounts
 
-        Also, returns 100 if configured to not sleep at all."""
-        
+        If we want to skip a current (or the next) sleep, or if we want
+        to abort an autorefresh loop, the main thread can use
+        set_abort_event() to send the corresponding signal. Signum = 1
+        implies that we want all accounts to abort or skip the current
+        or next sleep phase. Signum = 2 will end the autorefresh loop,
+        ie all accounts will return after they finished a sync.
+
+        This is a class method, it will send the signal to all accounts.
+        """
+        if signum == 1:
+            # resync signal, set config option for all accounts
+            for acctsection in getaccountlist(config):
+                config.set('Account ' + acctsection, "skipsleep", '1')
+        elif signum == 2:
+            # don't autorefresh anymore
+            cls.abort_signal.set()
+
+    def get_abort_event(self):
+        """Checks if an abort signal had been sent
+
+        If the 'skipsleep' config option for this account had been set,
+        with `set_abort_event(config, 1)` it will get cleared in this
+        function. Ie, we will only skip one sleep and not all.
+
+        :returns: True, if the main thread had called
+            :meth:`set_abort_event` earlier, otherwise 'False'.
+        """
+        skipsleep = self.getconfboolean("skipsleep", 0)
+        if skipsleep:
+            self.config.set(self.getsection(), "skipsleep", '0')
+        return skipsleep or Account.abort_signal.is_set()
+
+    def sleeper(self):
+        """Sleep if the account is set to autorefresh
+
+        :returns: 0:timeout expired, 1: canceled the timer,
+                  2:request to abort the program,
+                  100: if configured to not sleep at all.
+        """
         if not self.refreshperiod:
             return 100
 
@@ -147,70 +137,77 @@ class Account(CustomConfig.ConfigHelperMixin):
             item.startkeepalive()
         
         refreshperiod = int(self.refreshperiod * 60)
-#         try:
-#             sleepresult = siglistener.get_nowait()
-#             # retrieved signal before sleep started
-#             if sleepresult == 1:
-#                 # catching signal 1 here means folders were cleared before signal was posted
-#                 pass
-#         except Empty:
-#             sleepresult = self.ui.sleep(refreshperiod, siglistener)
-        sleepresult = self.ui.sleep(refreshperiod, siglistener)
-        if sleepresult == 1:
-            self.quicknum = 0
+        sleepresult = self.ui.sleep(refreshperiod, self)
 
         # Cancel keepalive
         for item in kaobjs:
             item.stopkeepalive()
-        return sleepresult
+
+        if sleepresult:
+            if Account.abort_signal.is_set():
+                return 2
+            self.quicknum = 0
+            return 1
+        return 0
             
-class AccountSynchronizationMixin:
-    def syncrunner(self, siglistener):
+    
+class SyncableAccount(Account):
+    """A syncable email account connecting 2 repositories
+
+    Derives from :class:`accounts.Account` but contains the additional
+    functions :meth:`syncrunner`, :meth:`sync`, :meth:`syncfolders`,
+    used for syncing."""
+
+    def syncrunner(self):
         self.ui.registerthread(self.name)
         self.ui.acct(self.name)
         accountmetadata = self.getaccountmeta()
         if not os.path.exists(accountmetadata):
             os.mkdir(accountmetadata, 0700)            
 
-        self.remoterepos = offlineimap.repository.Base.LoadRepository(self.getconf('remoterepository'), self, 'remote')
+        self.remoterepos = Repository(self, 'remote')
+        self.localrepos  = Repository(self, 'local')
+        self.statusrepos = Repository(self, 'status')
 
-        # Connect to the local repository.
-        self.localrepos = offlineimap.repository.Base.LoadRepository(self.getconf('localrepository'), self, 'local')
-
-        # Connect to the local cache.
-        self.statusrepos = offlineimap.repository.LocalStatus.LocalStatusRepository(self.getconf('localrepository'), self)
-
-        #might need changes here to ensure that one account sync does not crash others...
-        if not self.refreshperiod:
-            try:
-                self.sync(siglistener)
-            except:
-                self.ui.warn("Error occured attempting to sync account " + self.name \
-                    + ": " + str(sys.exc_info()[1]))
-            finally:
-                self.ui.acctdone(self.name)
-
-            return
-
-
-        looping = 1
+        # Loop account sync if needed (bail out after 3 failures)
+        looping = 3
         while looping:
             try:
-                self.sync(siglistener)
-            except:
-                self.ui.warn("Error occured attempting to sync account " + self.name \
-                    + ": " + str(sys.exc_info()[1]))
+                try:
+                    self.sync()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except OfflineImapError, e:                    
+                    self.ui.warn(e.reason)
+                    # Stop looping and bubble up Exception if needed.
+                    if e.severity >= OfflineImapError.ERROR.REPO:
+                        if looping:
+                            looping -= 1
+                        if e.severity >= OfflineImapError.ERROR.CRITICAL:
+                            raise
+                except:
+                    self.ui.warn("Error occured attempting to sync account "\
+                                 "'%s':\n%s"% (self, traceback.format_exc()))
+                else:
+                    # after success sync, reset the looping counter to 3
+                    if self.refreshperiod:
+                        looping = 3
             finally:
-                looping = self.sleeper(siglistener) != 2
+                if looping and self.sleeper() >= 2:
+                    looping = 0                    
                 self.ui.acctdone(self.name)
-
 
     def getaccountmeta(self):
         return os.path.join(self.metadatadir, 'Account-' + self.name)
 
-    def sync(self, siglistener):
-        # We don't need an account lock because syncitall() goes through
-        # each account once, then waits for all to finish.
+    def sync(self):
+        """Synchronize the account once, then return
+
+        Assumes that `self.remoterepos`, `self.localrepos`, and
+        `self.statusrepos` has already been populated, so it should only
+        be called from the :meth:`syncrunner` function.
+        """
+        folderthreads = []
 
         hook = self.getconf('presynchook', '')
         self.callhook(hook)
@@ -232,34 +229,38 @@ class AccountSynchronizationMixin:
             remoterepos = self.remoterepos
             localrepos = self.localrepos
             statusrepos = self.statusrepos
-            self.ui.syncfolders(remoterepos, localrepos)
-            remoterepos.syncfoldersto(localrepos, [statusrepos])
+            # replicate the folderstructure from REMOTE to LOCAL
+            if not localrepos.getconf('readonly', False):
+                self.ui.syncfolders(remoterepos, localrepos)
+                remoterepos.syncfoldersto(localrepos, [statusrepos])
 
-            siglistener.addfolders(remoterepos.getfolders(), bool(self.refreshperiod), quick)
-
-            while True:
-                folderthreads = []
-                for remotefolder, quick in siglistener.queuedfolders():
-                    thread = InstanceLimitedThread(\
-                        instancename = 'FOLDER_' + self.remoterepos.getname(),
-                        target = syncfolder,
-                        name = "Folder sync %s[%s]" % \
-                        (self.name, remotefolder.getvisiblename()),
-                        args = (self.name, remoterepos, remotefolder, localrepos,
-                                statusrepos, quick))
-                    thread.setDaemon(1)
-                    thread.start()
-                    folderthreads.append(thread)
-                threadutil.threadsreset(folderthreads)
-                if siglistener.clearfolders():
-                    break
+            # iterate through all folders on the remote repo and sync
+            for remotefolder in remoterepos.getfolders():
+                thread = InstanceLimitedThread(\
+                    instancename = 'FOLDER_' + self.remoterepos.getname(),
+                    target = syncfolder,
+                    name = "Folder sync [%s]" % self,
+                    args = (self.name, remoterepos, remotefolder, localrepos,
+                            statusrepos, quick))
+                thread.setDaemon(1)
+                thread.start()
+                folderthreads.append(thread)
+            # wait for all threads to finish
+            for thr in folderthreads:
+                thr.join()
             mbnames.write()
             localrepos.forgetfolders()
             remoterepos.forgetfolders()
+        except:
+            #error while syncing. Drop all connections that we have, they
+            #might be bogus by now (e.g. after suspend)
+            localrepos.dropconnections()
+            remoterepos.dropconnections()
+            raise
+        else:
+            # sync went fine. Hold or drop depending on config
             localrepos.holdordropconnections()
             remoterepos.holdordropconnections()
-        finally:
-            pass
 
         hook = self.getconf('postsynchook', '')
         self.callhook(hook)
@@ -277,14 +278,13 @@ class AccountSynchronizationMixin:
             self.ui.callhook("Hook return code: %d" % p.returncode)
         except:
             self.ui.warn("Exception occured while calling hook")
-    
-class SyncableAccount(Account, AccountSynchronizationMixin):
-    pass
+
 
 def syncfolder(accountname, remoterepos, remotefolder, localrepos,
                statusrepos, quick):
-    global mailboxes
-    ui = UIBase.getglobalui()
+    """This function is called as target for the
+    InstanceLimitedThread invokation in SyncableAccount."""
+    ui = getglobalui()
     ui.registerthread(accountname)
     try:
         # Load local folder.
@@ -316,13 +316,13 @@ def syncfolder(accountname, remoterepos, remotefolder, localrepos,
         ui.syncingfolder(remoterepos, remotefolder, localrepos, localfolder)
         ui.loadmessagelist(localrepos, localfolder)
         localfolder.cachemessagelist()
-        ui.messagelistloaded(localrepos, localfolder, len(localfolder.getmessagelist().keys()))
+        ui.messagelistloaded(localrepos, localfolder, localfolder.getmessagecount())
 
         # If either the local or the status folder has messages and there is a UID
         # validity problem, warn and abort.  If there are no messages, UW IMAPd
         # loses UIDVALIDITY.  But we don't really need it if both local folders are
         # empty.  So, in that case, just save it off.
-        if len(localfolder.getmessagelist()) or len(statusfolder.getmessagelist()):
+        if localfolder.getmessagecount() or statusfolder.getmessagecount():
             if not localfolder.isuidvalidityok():
                 ui.validityproblem(localfolder)
                 localrepos.restore_atime()
@@ -339,33 +339,36 @@ def syncfolder(accountname, remoterepos, remotefolder, localrepos,
         ui.loadmessagelist(remoterepos, remotefolder)
         remotefolder.cachemessagelist()
         ui.messagelistloaded(remoterepos, remotefolder,
-                             len(remotefolder.getmessagelist().keys()))
-
-
-        #
-
-        if not statusfolder.isnewfolder():
-            # Delete local copies of remote messages.  This way,
-            # if a message's flag is modified locally but it has been
-            # deleted remotely, we'll delete it locally.  Otherwise, we
-            # try to modify a deleted message's flags!  This step
-            # need only be taken if a statusfolder is present; otherwise,
-            # there is no action taken *to* the remote repository.
-
-            remotefolder.syncmessagesto_delete(localfolder, [localfolder,
-                                                             statusfolder])
-            ui.syncingmessages(localrepos, localfolder, remoterepos, remotefolder)
-            localfolder.syncmessagesto(statusfolder, [remotefolder, statusfolder])
+                             remotefolder.getmessagecount())
 
         # Synchronize remote changes.
-        ui.syncingmessages(remoterepos, remotefolder, localrepos, localfolder)
-        remotefolder.syncmessagesto(localfolder, [localfolder, statusfolder])
+        if not localrepos.getconf('readonly', False):
+            ui.syncingmessages(remoterepos, remotefolder, localrepos, localfolder)
+            remotefolder.syncmessagesto(localfolder, statusfolder)
+        else:
+            ui.debug('imap', "Not syncing to read-only repository '%s'" \
+                         % localrepos.getname())
+        
+        # Synchronize local changes
+        if not remoterepos.getconf('readonly', False):
+            ui.syncingmessages(localrepos, localfolder, remoterepos, remotefolder)
+            localfolder.syncmessagesto(remotefolder, statusfolder)
+        else:
+            ui.debug('', "Not syncing to read-only repository '%s'" \
+                         % remoterepos.getname())
 
-        # Make sure the status folder is up-to-date.
-        ui.syncingmessages(localrepos, localfolder, statusrepos, statusfolder)
-        localfolder.syncmessagesto(statusfolder)
         statusfolder.save()
         localrepos.restore_atime()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except OfflineImapError, e:
+        # bubble up severe Errors, skip folder otherwise
+        if e.severity > OfflineImapError.ERROR.FOLDER:
+            raise
+        else:
+            ui.warn("Aborting folder sync '%s' [acc: '%s']\nReason was: %s" %\
+                        (localfolder.name, accountname, e.reason))
     except:
-        ui.warn("ERROR in syncfolder for " + accountname + " folder  " + \
-        remotefolder.getvisiblename() +" : " +str(sys.exc_info()[1]))
+        ui.warn("ERROR in syncfolder for %s folder %s: %s" % \
+                (accountname,remotefolder.getvisiblename(),
+                 traceback.format_exc()))

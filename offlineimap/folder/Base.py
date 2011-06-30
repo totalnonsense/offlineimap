@@ -1,6 +1,5 @@
 # Base folder support
-# Copyright (C) 2002 John Goerzen
-# <jgoerzen@complete.org>
+# Copyright (C) 2002-2011 John Goerzen & contributors
 #
 #    This program is free software; you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -16,30 +15,27 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-from threading import *
 from offlineimap import threadutil
-from offlineimap.threadutil import InstanceLimitedThread
-from offlineimap.ui import UIBase
-import os.path, re
-import sys
+from offlineimap.ui import getglobalui
+import os.path
+import re
+import traceback
 
-class BaseFolder:
+class BaseFolder(object):
     def __init__(self):
-        self.uidlock = Lock()
-        
+        self.ui = getglobalui()
+
     def getname(self):
         """Returns name"""
+        return self.name
+
+    def __str__(self):
         return self.name
 
     def suggeststhreads(self):
         """Returns true if this folder suggests using threads for actions;
         false otherwise.  Probably only IMAP will return true."""
         return 0
-
-    def waitforthread(self):
-        """For threading folders, waits until there is a resource available
-        before firing off a thread.  For all others, returns immediately."""
-        pass
 
     def getcopyinstancelimit(self):
         """For threading folders, returns the instancelimitname for
@@ -72,7 +68,7 @@ class BaseFolder:
             return self.getroot() + self.getsep() + self.getname()
         else:
             return self.getname()
-    
+
     def getfolderbasename(self):
         foldername = self.getname()
         foldername = foldername.replace(self.repository.getsep(), '.')
@@ -81,6 +77,11 @@ class BaseFolder:
         return foldername
 
     def isuidvalidityok(self):
+        """Does the cached UID match the real UID
+
+        If required it caches the UID. In this case the function is not
+        threadsafe. So don't attempt to call it from concurrent threads."""
+
         if self.getsaveduidvalidity() != None:
             return self.getsaveduidvalidity() == self.getuidvalidity()
         else:
@@ -90,7 +91,7 @@ class BaseFolder:
     def _getuidfilename(self):
         return os.path.join(self.repository.getuiddir(),
                             self.getfolderbasename())
-            
+
     def getsaveduidvalidity(self):
         if hasattr(self, '_base_saved_uidvalidity'):
             return self._base_saved_uidvalidity
@@ -104,17 +105,18 @@ class BaseFolder:
         return self._base_saved_uidvalidity
 
     def saveuidvalidity(self):
+        """Save the UID value of the folder to the status
+
+        This function is not threadsafe, so don't attempt to call it
+        from concurrent threads."""
         newval = self.getuidvalidity()
         uidfilename = self._getuidfilename()
-        self.uidlock.acquire()
-        try:
-            file = open(uidfilename + ".tmp", "wt")
-            file.write("%d\n" % newval)
-            file.close()
-            os.rename(uidfilename + ".tmp", uidfilename)
-            self._base_saved_uidvalidity = newval
-        finally:
-            self.uidlock.release()
+
+        file = open(uidfilename + ".tmp", "wt")
+        file.write("%d\n" % newval)
+        file.close()
+        os.rename(uidfilename + ".tmp", uidfilename)
+        self._base_saved_uidvalidity = newval
 
     def getuidvalidity(self):
         raise NotImplementedException
@@ -130,26 +132,40 @@ class BaseFolder:
         You must call cachemessagelist() before calling this function!"""
         raise NotImplementedException
 
+    def uidexists(self, uid):
+        """Returns True if uid exists"""
+        return uid in self.getmessagelist()
+
+    def getmessageuidlist(self):
+        """Gets a list of UIDs.
+        You may have to call cachemessagelist() before calling this function!"""
+        return self.getmessagelist().keys()
+
+    def getmessagecount(self):
+        """Gets the number of messages."""
+        return len(self.getmessagelist())
+
     def getmessage(self, uid):
         """Returns the content of the specified message."""
         raise NotImplementedException
 
     def savemessage(self, uid, content, flags, rtime):
         """Writes a new message, with the specified uid.
-        If the uid is < 0, the backend should assign a new uid and return it.
 
-        If the backend cannot assign a new uid, it returns the uid passed in
-        WITHOUT saving the message.
+        If the uid is < 0: The backend should assign a new uid and
+           return it.  In case it cannot assign a new uid, it returns
+           the negative uid passed in WITHOUT saving the message.
 
-        If the backend CAN assign a new uid, but cannot find out what this UID
-        is (as is the case with many IMAP servers), it returns 0 but DOES save
-        the message.
+           If the backend CAN assign a new uid, but cannot find out what
+           this UID is (as is the case with some IMAP servers), it
+           returns 0 but DOES save the message.
         
-        IMAP backend should be the only one that can assign a new uid.
+           IMAP backend should be the only one that can assign a new
+           uid.
 
         If the uid is > 0, the backend should set the uid to this, if it can.
-        If it cannot set the uid to that, it will save it anyway.
-        It will return the uid assigned in any case.
+           If it cannot set the uid to that, it will save it anyway.
+           It will return the uid assigned in any case.
         """
         raise NotImplementedException
 
@@ -200,220 +216,205 @@ class BaseFolder:
         for uid in uidlist:
             self.deletemessage(uid)
 
-    def syncmessagesto_neguid_msg(self, uid, dest, applyto, register = 1):
-        if register:
-            UIBase.getglobalui().registerthread(self.getaccountname())
-        UIBase.getglobalui().copyingmessage(uid, self, applyto)
-        successobject = None
-        successuid = None
-        message = self.getmessage(uid)
-        flags = self.getmessageflags(uid)
-        rtime = self.getmessagetime(uid)
-        for tryappend in applyto:
-            successuid = tryappend.savemessage(uid, message, flags, rtime)
-            if successuid >= 0:
-                successobject = tryappend
-                break
-        # Did we succeed?
-        if successobject != None:
-            if successuid:       # Only if IMAP actually assigned a UID
-                # Copy the message to the other remote servers.
-                for appendserver in \
-                        [x for x in applyto if x != successobject]:
-                    appendserver.savemessage(successuid, message, flags, rtime)
-                    # Copy to its new name on the local server and delete
-                    # the one without a UID.
-                    self.savemessage(successuid, message, flags, rtime)
-            self.deletemessage(uid) # It'll be re-downloaded.
-        else:
-            # Did not find any server to take this message.  Ignore.
-            pass
-        
+    def copymessageto(self, uid, dstfolder, statusfolder, register = 1):
+        """Copies a message from self to dst if needed, updating the status
 
-    def syncmessagesto_neguid(self, dest, applyto):
-        """Pass 1 of folder synchronization.
-
-        Look for messages in self with a negative uid.  These are messages in
-        Maildirs that were not added by us.  Try to add them to the dests,
-        and once that succeeds, get the UID, add it to the others for real,
-        add it to local for real, and delete the fake one."""
-
-        uidlist = [uid for uid in self.getmessagelist().keys() if uid < 0]
-        threads = []
-
-        usethread = None
-        if applyto != None:
-            usethread = applyto[0]
-        
-        for uid in uidlist:
-            if usethread and usethread.suggeststhreads():
-                usethread.waitforthread()
-                thread = InstanceLimitedThread(\
-                    usethread.getcopyinstancelimit(),
-                    target = self.syncmessagesto_neguid_msg,
-                    name = "New msg sync from %s" % self.getvisiblename(),
-                    args = (uid, dest, applyto))
-                thread.setDaemon(1)
-                thread.start()
-                threads.append(thread)
-            else:
-                self.syncmessagesto_neguid_msg(uid, dest, applyto, register = 0)
-        for thread in threads:
-            thread.join()
-
-    def copymessageto(self, uid, applyto, register = 1):
+        :param uid: uid of the message to be copied.
+        :param dstfolder: A BaseFolder-derived instance
+        :param statusfolder: A LocalStatusFolder instance
+        :param register: whether we should register a new thread."
+        :returns: Nothing on success, or raises an Exception."""
         # Sometimes, it could be the case that if a sync takes awhile,
         # a message might be deleted from the maildir before it can be
         # synced to the status cache.  This is only a problem with
         # self.getmessage().  So, don't call self.getmessage unless
         # really needed.
         try:
-            if register:
-                UIBase.getglobalui().registerthread(self.getaccountname())
-            UIBase.getglobalui().copyingmessage(uid, self, applyto)
-            message = ''
-            # If any of the destinations actually stores the message body,
-            # load it up.
-            
-            for object in applyto:
-                if object.storesmessages():
-                    message = self.getmessage(uid)
-                    break
+            if register: # output that we start a new thread
+                self.ui.registerthread(self.getaccountname())
+
+            message = None
             flags = self.getmessageflags(uid)
             rtime = self.getmessagetime(uid)
-            for object in applyto:
-                newuid = object.savemessage(uid, message, flags, rtime)
-                if newuid > 0 and newuid != uid:
-                    # Change the local uid.
+
+            if uid > 0 and dstfolder.uidexists(uid):
+                # dst has message with that UID already, only update status
+                statusfolder.savemessage(uid, None, flags, rtime)
+                return
+
+            self.ui.copyingmessage(uid, self, [dstfolder])
+            # If any of the destinations actually stores the message body,
+            # load it up.
+            if dstfolder.storesmessages():
+
+                message = self.getmessage(uid)
+            #Succeeded? -> IMAP actually assigned a UID. If newid
+            #remained negative, no server was willing to assign us an
+            #UID. If newid is 0, saving succeeded, but we could not
+            #retrieve the new UID. Ignore message in this case.
+            newuid = dstfolder.savemessage(uid, message, flags, rtime)
+            if newuid > 0:
+                if newuid != uid:
+                    # Got new UID, change the local uid.
+                    #TODO: Maildir could do this with a rename rather than
+                    #load/save/del operation, IMPLEMENT a changeuid()
+                    #function or so.
                     self.savemessage(newuid, message, flags, rtime)
                     self.deletemessage(uid)
                     uid = newuid
+                # Save uploaded status in the statusfolder
+                statusfolder.savemessage(uid, message, flags, rtime)
+            else:
+                raise UserWarning("Trying to save msg (uid %d) on folder "
+                                  "%s returned invalid uid %d" % \
+                                      (uid,
+                                       dstfolder.getvisiblename(),
+                                       newuid))
+        except (KeyboardInterrupt):
+            raise
         except:
-            UIBase.getglobalui().warn("ERROR attempting to copy message " + str(uid) \
-                 + " for account " + self.getaccountname() + ":" + str(sys.exc_info()[1]))
-        
+            self.ui.warn("ERROR attempting to copy message " + str(uid) \
+                 + " for account " + self.getaccountname() + ":" \
+                 + traceback.format_exc())
+            raise
 
-    def syncmessagesto_copy(self, dest, applyto):
-        """Pass 2 of folder synchronization.
+    def syncmessagesto_copy(self, dstfolder, statusfolder):
+        """Pass1: Copy locally existing messages not on the other side
 
-        Look for messages present in self but not in dest.  If any, add
-        them to dest."""
+        This will copy messages to dstfolder that exist locally but are
+        not in the statusfolder yet. The strategy is:
+
+        1) Look for messages present in self but not in statusfolder.
+        2) invoke copymessageto() on those which:
+           - If dstfolder doesn't have it yet, add them to dstfolder.
+           - Update statusfolder
+        """
         threads = []
-        
-	dest_messagelist = dest.getmessagelist()
-        for uid in self.getmessagelist().keys():
-            if uid < 0:                 # Ignore messages that pass 1 missed.
-                continue
-            if not uid in dest_messagelist:
-                if self.suggeststhreads():
-                    self.waitforthread()
-                    thread = InstanceLimitedThread(\
-                        self.getcopyinstancelimit(),
-                        target = self.copymessageto,
-                        name = "Copy message %d from %s" % (uid,
-                                                            self.getvisiblename()),
-                        args = (uid, applyto))
-                    thread.setDaemon(1)
-                    thread.start()
-                    threads.append(thread)
-                else:
-                    self.copymessageto(uid, applyto, register = 0)
+
+        copylist = filter(lambda uid: not \
+                              statusfolder.uidexists(uid),
+                            self.getmessageuidlist())
+        for uid in copylist:
+            if self.suggeststhreads():
+                self.waitforthread()
+                thread = threadutil.InstanceLimitedThread(\
+                    self.getcopyinstancelimit(),
+                    target = self.copymessageto,
+                    name = "Copy message %d from %s" % (uid,
+                                                        self.getvisiblename()),
+                    args = (uid, dstfolder, statusfolder))
+                thread.setDaemon(1)
+                thread.start()
+                threads.append(thread)
+            else:
+                self.copymessageto(uid, dstfolder, statusfolder, register = 0)
+
         for thread in threads:
             thread.join()
 
-    def syncmessagesto_delete(self, dest, applyto):
-        """Pass 3 of folder synchronization.
+    def syncmessagesto_delete(self, dstfolder, statusfolder):
+        """Pass 2: Remove locally deleted messages on dst
 
-        Look for message present in dest but not in self.
-        If any, delete them."""
-        deletelist = []
-	self_messagelist = self.getmessagelist()
-        for uid in dest.getmessagelist().keys():
-            if uid < 0:
-                continue
-            if not uid in self_messagelist:
-                deletelist.append(uid)
+        Get all UIDS in statusfolder but not self. These are messages
+        that were deleted in 'self'. Delete those from dstfolder and
+        statusfolder."""
+        deletelist = filter(lambda uid: uid>=0 \
+                                and not self.uidexists(uid),
+                            statusfolder.getmessageuidlist())
         if len(deletelist):
-            UIBase.getglobalui().deletingmessages(deletelist, applyto)
-            for object in applyto:
-                object.deletemessages(deletelist)
+            self.ui.deletingmessages(deletelist, [dstfolder])
+            # delete in statusfolder first to play safe. In case of abort, we
+            # won't lose message, we will just retransmit some unneccessary.
+            for folder in [statusfolder, dstfolder]:
+                folder.deletemessages(deletelist)
 
-    def syncmessagesto_flags(self, dest, applyto):
-        """Pass 4 of folder synchronization.
+    def syncmessagesto_flags(self, dstfolder, statusfolder):
+        """Pass 3: Flag synchronization
 
-        Look for any flag matching issues -- set dest message to have the
-        same flags that we have."""
-
-        # As an optimization over previous versions, we store up which flags
-        # are being used for an add or a delete.  For each flag, we store
-        # a list of uids to which it should be added.  Then, we can call
-        # addmessagesflags() to apply them in bulk, rather than one
-        # call per message as before.  This should result in some significant
-        # performance improvements.
-
+        Compare flag mismatches in self with those in statusfolder. If
+        msg has a valid UID and exists on dstfolder (has not e.g. been
+        deleted there), sync the flag change to both dstfolder and
+        statusfolder.
+        """
+        # For each flag, we store a list of uids to which it should be
+        # added.  Then, we can call addmessagesflags() to apply them in
+        # bulk, rather than one call per message.
         addflaglist = {}
         delflaglist = {}
-        
-        for uid in self.getmessagelist().keys():
-            if uid < 0:                 # Ignore messages missed by pass 1
+        for uid in self.getmessageuidlist():
+            # Ignore messages with negative UIDs missed by pass 1
+            # also don't do anything if the message has been deleted remotely
+            if uid < 0 or not dstfolder.uidexists(uid):
                 continue
-            selfflags = self.getmessageflags(uid)
-            destflags = dest.getmessageflags(uid)
 
-            addflags = [x for x in selfflags if x not in destflags]
+            selfflags = self.getmessageflags(uid)
+            statusflags = statusfolder.getmessageflags(uid)
+            #if we could not get message flags from LocalStatus, assume empty.
+            if statusflags is None:
+                statusflags = []
+            addflags = [x for x in selfflags if x not in statusflags]
 
             for flag in addflags:
                 if not flag in addflaglist:
                     addflaglist[flag] = []
                 addflaglist[flag].append(uid)
 
-            delflags = [x for x in destflags if x not in selfflags]
+            delflags = [x for x in statusflags if x not in selfflags]
             for flag in delflags:
                 if not flag in delflaglist:
                     delflaglist[flag] = []
                 delflaglist[flag].append(uid)
 
-        for object in applyto:
-            for flag in addflaglist.keys():
-                UIBase.getglobalui().addingflags(addflaglist[flag], flag, [object])
-                object.addmessagesflags(addflaglist[flag], [flag])
-            for flag in delflaglist.keys():
-                UIBase.getglobalui().deletingflags(delflaglist[flag], flag, [object])
-                object.deletemessagesflags(delflaglist[flag], [flag])
-                
-    def syncmessagesto(self, dest, applyto = None):
-        """Syncs messages in this folder to the destination.
-        If applyto is specified, it should be a list of folders (don't forget
-        to include dest!) to which all write actions should be applied.
-        It defaults to [dest] if not specified.  It is important that
-        the UID generator be listed first in applyto; that is, the other
-        applyto ones should be the ones that "copy" the main action."""
-        if applyto == None:
-            applyto = [dest]
+        for flag in addflaglist.keys():
+            self.ui.addingflags(addflaglist[flag], flag, dstfolder)
+            dstfolder.addmessagesflags(addflaglist[flag], [flag])
+            statusfolder.addmessagesflags(addflaglist[flag], [flag])
 
-        try:
-            self.syncmessagesto_neguid(dest, applyto)
-        except:
-            UIBase.getglobalui().warn("ERROR attempting to handle negative uids " \
-                + "for account " + self.getaccountname() + ":" + str(sys.exc_info()[1]))
+        for flag in delflaglist.keys():
+            self.ui.deletingflags(delflaglist[flag], flag, dstfolder)
+            dstfolder.deletemessagesflags(delflaglist[flag], [flag])
+            statusfolder.deletemessagesflags(delflaglist[flag], [flag])
 
-        #all threads launched here are in try / except clauses when they copy anyway...
-        self.syncmessagesto_copy(dest, applyto)
+    def syncmessagesto(self, dstfolder, statusfolder):
+        """Syncs messages in this folder to the destination dstfolder.
 
-        try:
-            self.syncmessagesto_delete(dest, applyto)
-        except:
-            UIBase.getglobalui().warn("ERROR attempting to delete messages " \
-                + "for account " + self.getaccountname() + ":" + str(sys.exc_info()[1]))
+        This is the high level entry for syncing messages in one direction.
+        Syncsteps are:
 
-        # Now, the message lists should be identical wrt the uids present.
-        # (except for potential negative uids that couldn't be placed
-        # anywhere)
+        Pass1: Copy locally existing messages
+         Copy messages in self, but not statusfolder to dstfolder if not
+         already in dstfolder. dstfolder might assign a new UID (e.g. if
+         uploading to IMAP). Update statusfolder.
 
-        try:
-            self.syncmessagesto_flags(dest, applyto)
-        except:
-            UIBase.getglobalui().warn("ERROR attempting to sync flags " \
-                + "for account " + self.getaccountname() + ":" + str(sys.exc_info()[1]))
-        
-            
+        Pass2: Remove locally deleted messages
+         Get all UIDS in statusfolder but not self. These are messages
+         that were deleted in 'self'. Delete those from dstfolder and
+         statusfolder.
+
+         After this pass, the message lists should be identical wrt the
+         uids present (except for potential negative uids that couldn't
+         be placed anywhere).
+
+        Pass3: Synchronize flag changes 
+         Compare flag mismatches in self with those in statusfolder. If
+         msg has a valid UID and exists on dstfolder (has not e.g. been
+         deleted there), sync the flag change to both dstfolder and
+         statusfolder.
+
+        :param dstfolder: Folderinstance to sync the msgs to.
+        :param statusfolder: LocalStatus instance to sync against.
+        """
+        passes = [('copying messages'       , self.syncmessagesto_copy),
+                  ('deleting messages'      , self.syncmessagesto_delete),
+                  ('syncing flags'          , self.syncmessagesto_flags)]
+
+        for (passdesc, action) in passes:
+            try:
+                action(dstfolder, statusfolder)
+            except (KeyboardInterrupt):
+                raise
+            except:
+                self.ui.warn("ERROR attempting to sync flags " \
+                             + "for account " + self.getaccountname() \
+                             + ":" + traceback.format_exc())
+                raise

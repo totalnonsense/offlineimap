@@ -16,30 +16,14 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-from offlineimap import CustomConfig
-from offlineimap.ui import UIBase
 import os.path
-import sys
+import traceback
+from offlineimap import CustomConfig
+from offlineimap.ui import getglobalui
 
-def LoadRepository(name, account, reqtype):
-    from offlineimap.repository.Gmail import GmailRepository
-    from offlineimap.repository.IMAP import IMAPRepository, MappedIMAPRepository
-    from offlineimap.repository.Maildir import MaildirRepository
-    if reqtype == 'remote':
-        # For now, we don't support Maildirs on the remote side.
-        typemap = {'IMAP': IMAPRepository,
-                   'Gmail': GmailRepository}
-    elif reqtype == 'local':
-        typemap = {'IMAP': MappedIMAPRepository,
-                   'Maildir': MaildirRepository}
-    else:
-        raise ValueError, "Request type %s not supported" % reqtype
-    config = account.getconfig()
-    repostype = config.get('Repository ' + name, 'type').strip()
-    return typemap[repostype](name, account)
-
-class BaseRepository(CustomConfig.ConfigHelperMixin):
+class BaseRepository(object, CustomConfig.ConfigHelperMixin):
     def __init__(self, reposname, account):
+        self.ui = getglobalui()
         self.account = account
         self.config = account.getconfig()
         self.name = reposname
@@ -86,6 +70,9 @@ class BaseRepository(CustomConfig.ConfigHelperMixin):
         return self.account
 
     def getname(self):
+        return self.name
+
+    def __str__(self):
         return self.name
 
     def getuiddir(self):
@@ -158,10 +145,11 @@ class BaseRepository(CustomConfig.ConfigHelperMixin):
                     dest.makefolder(key)
                     for copyfolder in copyfolders:
                         copyfolder.makefolder(key.replace(dest.getsep(), copyfolder.getsep()))
+                except (KeyboardInterrupt):
+                    raise
                 except:
-                    UIBase.getglobalui().warn("ERROR Attempting to make folder " \
-                        + key + ":"  +str(sys.exc_info()[1]))
-                
+                    self.ui.warn("ERROR Attempting to create folder " \
+                        + key + ":"  +traceback.format_exc())
 
         #
         # Find deleted folders.

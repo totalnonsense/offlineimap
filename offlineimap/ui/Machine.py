@@ -15,10 +15,12 @@
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
-import offlineimap.version
-import urllib, sys, re, time, traceback, threading, thread
+import urllib
+import sys
+import time
 from UIBase import UIBase
-from threading import *
+from threading import currentThread, Lock
+import offlineimap
 
 protocol = '6.0.0'
 
@@ -56,7 +58,7 @@ class MachineUI(UIBase):
     def _display(s, msg):
         s._printData('_display', msg)
 
-    def warn(s, msg, minor):
+    def warn(s, msg, minor = 0):
         s._printData('warn', '%s\n%d' % (msg, int(minor)))
 
     def registerthread(s, account):
@@ -124,17 +126,15 @@ class MachineUI(UIBase):
         ds = s.folderlist(destlist)
         s._printData('deletingmessages', "%s\n%s" % (s.uidlist(uidlist), ds))
 
-    def addingflags(s, uidlist, flags, destlist):
-        ds = s.folderlist(destlist)
+    def addingflags(s, uidlist, flags, dest):
         s._printData("addingflags", "%s\n%s\n%s" % (s.uidlist(uidlist),
                                                     "\f".join(flags),
-                                                    ds))
+                                                    dest))
 
-    def deletingflags(s, uidlist, flags, destlist):
-        ds = s.folderlist(destlist)
+    def deletingflags(s, uidlist, flags, dest):
         s._printData('deletingflags', "%s\n%s\n%s" % (s.uidlist(uidlist),
                                                       "\f".join(flags),
-                                                      ds))
+                                                      dest))
 
     def threadException(s, thread):
         print s.getThreadExceptionString(thread)
@@ -173,7 +173,7 @@ class MachineUI(UIBase):
             s.outputlock.release()
 
     def init_banner(s):
-        s._printData('initbanner', offlineimap.version.banner)
+        s._printData('initbanner', offlineimap.banner)
 
     def callhook(s, msg):
         s._printData('callhook', msg)
